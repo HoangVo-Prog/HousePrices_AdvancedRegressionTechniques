@@ -384,13 +384,13 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
             model = ElasticNet(
                 alpha=best_params.get("alpha", 0.01),
                 l1_ratio=best_params.get("l1_ratio", 0.5),
-                max_iter=100000,
+                max_iter=1000000,
                 random_state=RANDOM_STATE
             )
         elif name == "Ridge":
             model = Ridge(alpha=best_params.get("alpha", 10.0), random_state=RANDOM_STATE)
         elif name == "Lasso":
-            model = Lasso(alpha=best_params.get("alpha", 0.0005), max_iter=100000, random_state=RANDOM_STATE)
+            model = Lasso(alpha=best_params.get("alpha", 0.0005), max_iter=1000000, random_state=RANDOM_STATE)
         elif name == "SVR":
             model = SVR(
                 kernel="rbf",
@@ -584,3 +584,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
