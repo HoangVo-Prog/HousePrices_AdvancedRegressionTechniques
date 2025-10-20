@@ -2,12 +2,11 @@
 """
 Model selection + hyperparameter tuning + 3-model stacking for Ames-like house prices.
 
+Now includes 8 models:
+- RandomForest, XGB, SVR, ElasticNet, Ridge, Lasso, CatBoost, LightGBM
+
 Usage:
     python model_selection_and_stacking.py
-
-Assumptions:
-- You have `house_price_pipeline.py` available (from earlier step).
-- `xgboost` and `optuna` are installed; if not, the script will skip them gracefully.
 """
 
 import warnings
@@ -38,6 +37,18 @@ try:
     HAS_OPTUNA = True
 except Exception:
     HAS_OPTUNA = False
+
+try:
+    from catboost import CatBoostRegressor
+    HAS_CAT = True
+except Exception:
+    HAS_CAT = False
+
+try:
+    from lightgbm import LGBMRegressor
+    HAS_LGBM = True
+except Exception:
+    HAS_LGBM = False
 
 from house_price_pipeline import make_feature_space
 
@@ -95,6 +106,33 @@ def base_models_dict():
             max_bin=256,
             missing=np.nan
         )
+    if HAS_CAT:
+        models["CatBoost"] = CatBoostRegressor(
+            loss_function="RMSE",
+            n_estimators=3000,
+            depth=6,
+            learning_rate=0.05,
+            l2_leaf_reg=3.0,
+            subsample=0.8,
+            colsample_bylevel=0.8,
+            random_state=RANDOM_STATE,
+            verbose=False
+        )
+    if HAS_LGBM:
+        models["LGBM"] = LGBMRegressor(
+            n_estimators=5000,
+            learning_rate=0.03,
+            num_leaves=31,
+            max_depth=-1,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            min_split_gain=0.0,
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        )
     return models
 
 def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe: Pipeline, cv_splits=5, out_prefix="baseline"):
@@ -137,7 +175,7 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
     res_df.to_csv(f"{out_prefix}_model_cv_test_results.csv", index=False)
 
     # Plots
-    plt.figure(figsize=(9,5))
+    plt.figure(figsize=(10,5))
     idx = np.arange(len(res_df))
     plt.bar(idx, res_df["cv_rmse_mean"].values)
     plt.xticks(idx, res_df["model"].values, rotation=45, ha="right")
@@ -147,7 +185,7 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
     plt.savefig(f"{out_prefix}_cv_rmse.png", dpi=150)
     plt.close()
 
-    plt.figure(figsize=(9,5))
+    plt.figure(figsize=(10,5))
     plt.bar(idx, res_df["cv_r2_mean"].values)
     plt.xticks(idx, res_df["model"].values, rotation=45, ha="right")
     plt.ylabel("CV R² (higher is better)")
@@ -157,7 +195,7 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
     plt.close()
 
     # Test plots
-    plt.figure(figsize=(9,5))
+    plt.figure(figsize=(10,5))
     plt.bar(idx, res_df["test_rmse"].values)
     plt.xticks(idx, res_df["model"].values, rotation=45, ha="right")
     plt.ylabel("Test RMSE")
@@ -166,7 +204,7 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
     plt.savefig(f"{out_prefix}_test_rmse.png", dpi=150)
     plt.close()
 
-    plt.figure(figsize=(9,5))
+    plt.figure(figsize=(10,5))
     plt.bar(idx, res_df["test_r2"].values)
     plt.xticks(idx, res_df["model"].values, rotation=45, ha="right")
     plt.ylabel("Test R²")
@@ -248,6 +286,52 @@ def make_objective(name, X_train, y_train, feature_pipe):
                 max_bin=max_bin,
                 missing=np.nan
             )
+
+        elif name == "CatBoost" and HAS_CAT:
+            n_estimators = trial.suggest_int("n_estimators", 1000, 6000, step=500)
+            depth = trial.suggest_int("depth", 4, 10)
+            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
+            l2_leaf_reg = trial.suggest_float("l2_leaf_reg", 1.0, 10.0, log=True)
+            subsample = trial.suggest_float("subsample", 0.6, 0.95)
+            colsample_bylevel = trial.suggest_float("colsample_bylevel", 0.6, 1.0)
+            model = CatBoostRegressor(
+                loss_function="RMSE",
+                n_estimators=n_estimators,
+                depth=depth,
+                learning_rate=learning_rate,
+                l2_leaf_reg=l2_leaf_reg,
+                subsample=subsample,
+                colsample_bylevel=colsample_bylevel,
+                random_state=RANDOM_STATE,
+                verbose=False
+            )
+
+        elif name == "LGBM" and HAS_LGBM:
+            n_estimators = trial.suggest_int("n_estimators", 2000, 8000, step=500)
+            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
+            num_leaves = trial.suggest_int("num_leaves", 16, 128, step=4)
+            max_depth = trial.suggest_int("max_depth", -1, 32)
+            min_child_samples = trial.suggest_int("min_child_samples", 5, 50)
+            subsample = trial.suggest_float("subsample", 0.6, 0.95)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.6, 1.0)
+            reg_alpha = trial.suggest_float("reg_alpha", 0.0, 1.0)
+            reg_lambda = trial.suggest_float("reg_lambda", 0.0, 10.0)
+            min_split_gain = trial.suggest_float("min_split_gain", 0.0, 0.5)
+            model = LGBMRegressor(
+                n_estimators=n_estimators,
+                learning_rate=learning_rate,
+                num_leaves=num_leaves,
+                max_depth=max_depth,
+                min_child_samples=min_child_samples,
+                subsample=subsample,
+                colsample_bytree=colsample_bytree,
+                reg_alpha=reg_alpha,
+                reg_lambda=reg_lambda,
+                min_split_gain=min_split_gain,
+                random_state=RANDOM_STATE,
+                n_jobs=-1
+            )
+
         else:
             raise RuntimeError(f"Unknown or unavailable model for tuning: {name}")
 
@@ -267,6 +351,12 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
     for name in top_names:
         if name == "XGB" and not HAS_XGB:
             print("[tune] Skipping XGB (xgboost not installed).")
+            continue
+        if name == "CatBoost" and not HAS_CAT:
+            print("[tune] Skipping CatBoost (catboost not installed).")
+            continue
+        if name == "LGBM" and not HAS_LGBM:
+            print("[tune] Skipping LGBM (lightgbm not installed).")
             continue
         if not HAS_OPTUNA:
             print("[tune] Optuna not installed; skipping tuning for", name)
@@ -294,13 +384,13 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
             model = ElasticNet(
                 alpha=best_params.get("alpha", 0.01),
                 l1_ratio=best_params.get("l1_ratio", 0.5),
-                max_iter=30000,
+                max_iter=100000,
                 random_state=RANDOM_STATE
             )
         elif name == "Ridge":
             model = Ridge(alpha=best_params.get("alpha", 10.0), random_state=RANDOM_STATE)
         elif name == "Lasso":
-            model = Lasso(alpha=best_params.get("alpha", 0.0005), max_iter=30000, random_state=RANDOM_STATE)
+            model = Lasso(alpha=best_params.get("alpha", 0.0005), max_iter=100000, random_state=RANDOM_STATE)
         elif name == "SVR":
             model = SVR(
                 kernel="rbf",
@@ -325,6 +415,33 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 tree_method="hist",
                 max_bin=best_params.get("max_bin", 256),
                 missing=np.nan
+            )
+        elif name == "CatBoost" and HAS_CAT:
+            model = CatBoostRegressor(
+                loss_function="RMSE",
+                n_estimators=best_params.get("n_estimators", 3000),
+                depth=best_params.get("depth", 6),
+                learning_rate=best_params.get("learning_rate", 0.05),
+                l2_leaf_reg=best_params.get("l2_leaf_reg", 3.0),
+                subsample=best_params.get("subsample", 0.8),
+                colsample_bylevel=best_params.get("colsample_bylevel", 0.8),
+                random_state=RANDOM_STATE,
+                verbose=False
+            )
+        elif name == "LGBM" and HAS_LGBM:
+            model = LGBMRegressor(
+                n_estimators=best_params.get("n_estimators", 5000),
+                learning_rate=best_params.get("learning_rate", 0.03),
+                num_leaves=best_params.get("num_leaves", 31),
+                max_depth=best_params.get("max_depth", -1),
+                min_child_samples=best_params.get("min_child_samples", 20),
+                subsample=best_params.get("subsample", 0.8),
+                colsample_bytree=best_params.get("colsample_bytree", 0.8),
+                reg_alpha=best_params.get("reg_alpha", 0.1),
+                reg_lambda=best_params.get("reg_lambda", 1.0),
+                min_split_gain=best_params.get("min_split_gain", 0.0),
+                random_state=RANDOM_STATE,
+                n_jobs=-1
             )
         else:
             continue
