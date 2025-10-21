@@ -560,7 +560,7 @@ def main():
 
     # Save summary
     summary = baseline_df.copy()
-    summary = summary.append({
+    stack_row = {
         "model": "STACK(" + "+".join(top3_names) + ")",
         "cv_rmse_mean": np.nan,
         "cv_rmse_std": np.nan,
@@ -568,7 +568,8 @@ def main():
         "cv_r2_std": np.nan,
         "test_rmse": stack_rmse,
         "test_r2": stack_r2,
-    }, ignore_index=True)
+    }
+    summary = pd.concat([summary, pd.DataFrame([stack_row])], ignore_index=True)
     summary.to_csv("final_summary.csv", index=False)
 
     print("Artifacts written:")
@@ -584,5 +585,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
