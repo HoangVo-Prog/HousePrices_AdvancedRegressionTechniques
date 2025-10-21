@@ -118,21 +118,21 @@ def base_models_dict():
             random_state=RANDOM_STATE,
             verbose=False
         )
-    if HAS_LGBM:
-        models["LGBM"] = LGBMRegressor(
-            n_estimators=5000,
-            learning_rate=0.03,
-            num_leaves=31,
-            max_depth=-1,
-            min_child_samples=20,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,
-            reg_lambda=1.0,
-            min_split_gain=0.0,
-            random_state=RANDOM_STATE,
-            n_jobs=-1
-        )
+    # if HAS_LGBM:
+    #     models["LGBM"] = LGBMRegressor(
+    #         n_estimators=5000,
+    #         learning_rate=0.03,
+    #         num_leaves=31,
+    #         max_depth=-1,
+    #         min_child_samples=20,
+    #         subsample=0.8,
+    #         colsample_bytree=0.8,
+    #         reg_alpha=0.1,
+    #         reg_lambda=1.0,
+    #         min_split_gain=0.0,
+    #         random_state=RANDOM_STATE,
+    #         n_jobs=-1
+    #     )
     return models
 
 def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe: Pipeline, cv_splits=5, out_prefix="baseline"):
@@ -584,4 +584,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
