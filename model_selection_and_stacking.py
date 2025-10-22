@@ -2,11 +2,11 @@
 """
 Model selection + hyperparameter tuning + 3-model stacking for Ames-like house prices.
 
-Now includes 8 models:
-- RandomForest, XGB, SVR, ElasticNet, Ridge, Lasso, CatBoost, LightGBM
+Now tries ALL 3-model combinations from the top-5 models (C(5,3)=10 combos),
+evaluates each, and keeps the best stack by Test RMSE.
 
-Usage:
-    python model_selection_and_stacking.py
+Models pool (up to 8):
+- RandomForest, XGB, SVR, ElasticNet, Ridge, Lasso, CatBoost, LightGBM
 """
 
 import warnings
@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore")
 
 import math
 import json
+import itertools
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -24,6 +25,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor, StackingRegressor
 from sklearn.linear_model import ElasticNet, Ridge, Lasso, RidgeCV
 from sklearn.svm import SVR
+from sklearn.base import clone
 
 # Optional deps
 try:
@@ -58,6 +60,7 @@ RANDOM_STATE = 42
 # Helpers
 # ---------------------------
 def rmse(y_true, y_pred) -> float:
+    from sklearn.metrics import mean_squared_error
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 def get_scorers():
@@ -88,7 +91,8 @@ def base_models_dict():
         "Lasso": Lasso(alpha=0.0005, max_iter=20000, random_state=RANDOM_STATE),
         "SVR": SVR(kernel="rbf", C=10.0, epsilon=0.1, gamma="scale"),
     }
-    if HAS_XGB:
+    try:
+        import xgboost as xgb
         models["XGB"] = xgb.XGBRegressor(
             n_estimators=4000,
             learning_rate=0.03,
@@ -106,7 +110,10 @@ def base_models_dict():
             max_bin=256,
             missing=np.nan
         )
-    if HAS_CAT:
+    except Exception:
+        pass
+    try:
+        from catboost import CatBoostRegressor
         models["CatBoost"] = CatBoostRegressor(
             loss_function="RMSE",
             n_estimators=3000,
@@ -118,21 +125,26 @@ def base_models_dict():
             random_state=RANDOM_STATE,
             verbose=False
         )
-    # if HAS_LGBM:
-    #     models["LGBM"] = LGBMRegressor(
-    #         n_estimators=5000,
-    #         learning_rate=0.03,
-    #         num_leaves=31,
-    #         max_depth=-1,
-    #         min_child_samples=20,
-    #         subsample=0.8,
-    #         colsample_bytree=0.8,
-    #         reg_alpha=0.1,
-    #         reg_lambda=1.0,
-    #         min_split_gain=0.0,
-    #         random_state=RANDOM_STATE,
-    #         n_jobs=-1
-    #     )
+    except Exception:
+        pass
+    try:
+        from lightgbm import LGBMRegressor
+        models["LGBM"] = LGBMRegressor(
+            n_estimators=5000,
+            learning_rate=0.03,
+            num_leaves=31,
+            max_depth=-1,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            min_split_gain=0.0,
+            random_state=RANDOM_STATE,
+            n_jobs=-1
+        )
+    except Exception:
+        pass
     return models
 
 def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe: Pipeline, cv_splits=5, out_prefix="baseline"):
@@ -141,7 +153,7 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
 
     print(f"Evaluating {len(models)} models with {cv_splits}-fold CV...")
     for name, est in models.items():
-        pipe = Pipeline([("features", feature_pipe), ("model", est)])
+        pipe = Pipeline([("features", clone(feature_pipe)), ("model", est)])
         cv = KFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
         scores = cross_validate(
             pipe, X_train, y_train, cv=cv, scoring=get_scorers(), return_train_score=False, n_jobs=-1
@@ -256,10 +268,11 @@ def make_objective(name, X_train, y_train, feature_pipe):
         elif name == "SVR":
             C = trial.suggest_float("C", 0.1, 100.0, log=True)
             epsilon = trial.suggest_float("epsilon", 1e-3, 1.0, log=True)
-            gamma = trial.suggest_categorical("gamma", ["scale", "auto"])
+            gamma = trial.suggest_categorical("gamma", ["scale", "auto")
             model = SVR(kernel="rbf", C=C, epsilon=epsilon, gamma=gamma)
 
-        elif name == "XGB" and HAS_XGB:
+        elif name == "XGB":
+            import xgboost as xgb
             learning_rate = trial.suggest_float("learning_rate", 0.005, 0.08, log=True)
             max_depth = trial.suggest_int("max_depth", 3, 7)
             min_child_weight = trial.suggest_float("min_child_weight", 1.0, 8.0)
@@ -287,7 +300,8 @@ def make_objective(name, X_train, y_train, feature_pipe):
                 missing=np.nan
             )
 
-        elif name == "CatBoost" and HAS_CAT:
+        elif name == "CatBoost":
+            from catboost import CatBoostRegressor
             n_estimators = trial.suggest_int("n_estimators", 1000, 6000, step=500)
             depth = trial.suggest_int("depth", 4, 10)
             learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
@@ -306,7 +320,8 @@ def make_objective(name, X_train, y_train, feature_pipe):
                 verbose=False
             )
 
-        elif name == "LGBM" and HAS_LGBM:
+        elif name == "LGBM":
+            from lightgbm import LGBMRegressor
             n_estimators = trial.suggest_int("n_estimators", 2000, 8000, step=500)
             learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
             num_leaves = trial.suggest_int("num_leaves", 16, 128, step=4)
@@ -335,7 +350,7 @@ def make_objective(name, X_train, y_train, feature_pipe):
         else:
             raise RuntimeError(f"Unknown or unavailable model for tuning: {name}")
 
-        pipe = Pipeline([("features", feature_pipe), ("model", model)])
+        pipe = Pipeline([("features", clone(feature_pipe)), ("model", model)])
         cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
         scores = cross_validate(
             pipe, X_train, y_train, cv=cv, scoring=get_scorers(), return_train_score=False, n_jobs=-1
@@ -349,16 +364,9 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
     tuned = {}
     histories = {}
     for name in top_names:
-        if name == "XGB" and not HAS_XGB:
-            print("[tune] Skipping XGB (xgboost not installed).")
-            continue
-        if name == "CatBoost" and not HAS_CAT:
-            print("[tune] Skipping CatBoost (catboost not installed).")
-            continue
-        if name == "LGBM" and not HAS_LGBM:
-            print("[tune] Skipping LGBM (lightgbm not installed).")
-            continue
-        if not HAS_OPTUNA:
+        try:
+            import optuna  # ensure available
+        except Exception:
             print("[tune] Optuna not installed; skipping tuning for", name)
             continue
 
@@ -384,13 +392,13 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
             model = ElasticNet(
                 alpha=best_params.get("alpha", 0.01),
                 l1_ratio=best_params.get("l1_ratio", 0.5),
-                max_iter=1000000,
+                max_iter=30000,
                 random_state=RANDOM_STATE
             )
         elif name == "Ridge":
             model = Ridge(alpha=best_params.get("alpha", 10.0), random_state=RANDOM_STATE)
         elif name == "Lasso":
-            model = Lasso(alpha=best_params.get("alpha", 0.0005), max_iter=1000000, random_state=RANDOM_STATE)
+            model = Lasso(alpha=best_params.get("alpha", 0.0005), max_iter=30000, random_state=RANDOM_STATE)
         elif name == "SVR":
             model = SVR(
                 kernel="rbf",
@@ -398,7 +406,8 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 epsilon=best_params.get("epsilon", 0.1),
                 gamma=best_params.get("gamma", "scale"),
             )
-        elif name == "XGB" and HAS_XGB:
+        elif name == "XGB":
+            import xgboost as xgb
             model = xgb.XGBRegressor(
                 n_estimators=6000,
                 learning_rate=best_params.get("learning_rate", 0.03),
@@ -416,7 +425,8 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 max_bin=best_params.get("max_bin", 256),
                 missing=np.nan
             )
-        elif name == "CatBoost" and HAS_CAT:
+        elif name == "CatBoost":
+            from catboost import CatBoostRegressor
             model = CatBoostRegressor(
                 loss_function="RMSE",
                 n_estimators=best_params.get("n_estimators", 3000),
@@ -428,7 +438,8 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 random_state=RANDOM_STATE,
                 verbose=False
             )
-        elif name == "LGBM" and HAS_LGBM:
+        elif name == "LGBM":
+            from lightgbm import LGBMRegressor
             model = LGBMRegressor(
                 n_estimators=best_params.get("n_estimators", 5000),
                 learning_rate=best_params.get("learning_rate", 0.03),
@@ -454,16 +465,36 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
         print(f"[tune] {name}: best CV RMSE={best_score:.5f}, best_params={best_params}")
     return tuned, histories
 
-def build_stacking(top3_tuned: dict, feature_pipe: Pipeline):
+def build_stacking_from_names(names, tuned: dict, base_models: dict, feature_pipe: Pipeline):
+    # Use tuned estimator if available, else baseline default
     estimators = []
-    for name, info in top3_tuned.items():
-        estimators.append((name, info["estimator"]))
+    for n in names:
+        if n in tuned:
+            est = tuned[n]["estimator"]
+        else:
+            est = base_models[n]
+        estimators.append((n, est))
     meta = RidgeCV(alphas=np.logspace(-3, 3, 25))
     stack = Pipeline([
-        ("features", feature_pipe),
+        ("features", clone(feature_pipe)),
         ("stack", StackingRegressor(estimators=estimators, final_estimator=meta, n_jobs=-1, passthrough=False))
     ])
     return stack
+
+def fit_and_eval_stack(stack: Pipeline, X_train, y_train, X_test, y_test, do_cv=True):
+    cv_rmse = np.nan
+    cv_r2 = np.nan
+    if do_cv:
+        cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+        scores = cross_validate(stack, X_train, y_train, cv=cv, scoring=get_scorers(), return_train_score=False, n_jobs=-1)
+        cv_rmse = -scores["test_neg_rmse"].mean()
+        cv_r2 = scores["test_r2"].mean()
+
+    stack.fit(X_train, y_train)
+    yp = stack.predict(X_test)
+    test_rmse = rmse(y_test, yp)
+    test_r2 = r2_score(y_test, yp)
+    return cv_rmse, cv_r2, test_rmse, test_r2, yp
 
 def main():
     # Load data
@@ -493,98 +524,113 @@ def main():
     with open("tuning_histories.json", "w") as f:
         json.dump(histories, f)
 
-    # If no tuning was possible, fall back to baseline top-3
-    if not tuned:
-        print("No tuned models available; falling back to baseline top-3.")
-        top3_names = list(baseline_df.sort_values("cv_rmse_mean")["model"].head(3).values)
-        top3_tuned = {name: {"estimator": base_models_dict()[name]} for name in top3_names}
-    else:
-        # Pick top-3 tuned by best_cv_rmse
-        top3_names = sorted(tuned.keys(), key=lambda k: tuned[k]["best_cv_rmse"])[:3]
-        top3_tuned = {name: tuned[name] for name in top3_names}
+    # Build all 3-model combinations from top-5
+    combos = list(itertools.combinations(top5, 3))
+    print(f"Evaluating {len(combos)} stack combinations from top-5...")
 
-    print("Stacking these 3 models:", top3_names)
+    base_models = base_models_dict()  # for fallback estimators
 
-    # 3) Build stacking regressor
-    stack = build_stacking(top3_tuned, feature_pipe)
+    stack_records = []
+    stack_preds = {}
 
-    # Fit stack and evaluate
-    stack.fit(X_train, y_train)
-    ypred_stack = stack.predict(X_test)
-    stack_rmse = rmse(y_test, ypred_stack)
-    stack_r2 = r2_score(y_test, ypred_stack)
-    print(f"[STACK] Test RMSE={stack_rmse:.5f}  Test R2={stack_r2:.5f}")
+    for names in combos:
+        stack = build_stacking_from_names(names, tuned, base_models, feature_pipe)
+        cv_rmse, cv_r2, test_rmse, test_r2, yp = fit_and_eval_stack(stack, X_train, y_train, X_test, y_test, do_cv=True)
+        combo_name = "+".join(names)
+        print(f"[STACK {combo_name}] CV RMSE={cv_rmse:.5f}  CV R2={cv_r2:.5f} | Test RMSE={test_rmse:.5f}  Test R2={test_r2:.5f}")
+        stack_records.append({
+            "stack": combo_name,
+            "cv_rmse": cv_rmse,
+            "cv_r2": cv_r2,
+            "test_rmse": test_rmse,
+            "test_r2": test_r2,
+        })
+        # Save predictions for this stack
+        col_name = f"Stack_{combo_name}"
+        stack_preds[col_name] = yp
 
-    # Plot predicted vs true for stack
+    stacks_df = pd.DataFrame(stack_records).sort_values("test_rmse")
+    stacks_df.to_csv("stacking_grid_results.csv", index=False)
+
+    # Pick best stack by Test RMSE
+    best_row = stacks_df.iloc[0]
+    best_combo = best_row["stack"].split("+")
+    print("Best stack (by Test RMSE):", dict(best_row))
+
+    # Rebuild best stack (fresh fit for final plots)
+    best_stack = build_stacking_from_names(best_combo, tuned, base_models, feature_pipe)
+    _, _, best_test_rmse, best_test_r2, best_pred = fit_and_eval_stack(best_stack, X_train, y_train, X_test, y_test, do_cv=False)
+
+    # Plot predicted vs true for best stack
     plt.figure(figsize=(6,6))
-    plt.scatter(y_test.values, ypred_stack, alpha=0.6, edgecolors="none")
-    lims = [min(y_test.min(), ypred_stack.min()), max(y_test.max(), ypred_stack.max())]
+    plt.scatter(y_test.values, best_pred, alpha=0.6, edgecolors="none")
+    lims = [min(y_test.min(), best_pred.min()), max(y_test.max(), best_pred.max())]
     plt.plot(lims, lims)
     plt.xlabel("True SalePrice")
     plt.ylabel("Predicted SalePrice")
-    plt.title("Stacking Regressor: True vs Predicted")
+    plt.title(f"Best Stack ({'+'.join(best_combo)}): True vs Predicted")
     plt.tight_layout()
-    plt.savefig("stack_true_vs_pred.png", dpi=150)
+    plt.savefig("stack_true_vs_pred_best.png", dpi=150)
     plt.close()
 
-    # Compare bars: best single vs stack
+    # Compare bars: best single vs best stack
     best_single = baseline_df.sort_values("test_rmse").iloc[0]
-    names = [best_single["model"], "Stack"]
-    vals_rmse = [best_single["test_rmse"], stack_rmse]
-    vals_r2 = [best_single["test_r2"], stack_r2]
+    names_plot = [best_single["model"], f"Stack({'+'.join(best_combo)})"]
+    vals_rmse = [best_single["test_rmse"], best_test_rmse]
+    vals_r2 = [best_single["test_r2"], best_test_r2]
 
     plt.figure(figsize=(6,4))
-    plt.bar(np.arange(len(names)), vals_rmse)
-    plt.xticks(np.arange(len(names)), names)
+    plt.bar(np.arange(len(names_plot)), vals_rmse)
+    plt.xticks(np.arange(len(names_plot)), names_plot, rotation=15, ha="right")
     plt.ylabel("Test RMSE")
-    plt.title("Best single vs Stack (Test RMSE)")
+    plt.title("Best single vs Best stack (Test RMSE)")
     plt.tight_layout()
-    plt.savefig("best_vs_stack_rmse.png", dpi=150)
+    plt.savefig("best_single_vs_best_stack_rmse.png", dpi=150)
     plt.close()
 
     plt.figure(figsize=(6,4))
-    plt.bar(np.arange(len(names)), vals_r2)
-    plt.xticks(np.arange(len(names)), names)
+    plt.bar(np.arange(len(names_plot)), vals_r2)
+    plt.xticks(np.arange(len(names_plot)), names_plot, rotation=15, ha="right")
     plt.ylabel("Test R²")
-    plt.title("Best single vs Stack (Test R²)")
+    plt.title("Best single vs Best stack (Test R²)")
     plt.tight_layout()
-    plt.savefig("best_vs_stack_r2.png", dpi=150)
+    plt.savefig("best_single_vs_best_stack_r2.png", dpi=150)
     plt.close()
 
-    # Save all test predictions (including stack)
+    # Save all test predictions (including stacks)
     out_preds = preds_test.copy()
-    out_preds["Stack"] = ypred_stack
+    out_preds.update(stack_preds)  # add every stack’s predictions
+    # Also include a short alias "Stack" for the best stack
+    out_preds["Stack"] = best_pred
+    out_preds_df = pd.DataFrame(out_preds)
     if "Id" in df.columns:
-        out_preds.insert(0, "Id", df.loc[X_test.index, "Id"].values)
-    out_preds.to_csv("test_predictions_all_models.csv", index=False)
+        out_preds_df.insert(0, "Id", df.loc[X_test.index, "Id"].values)
+    out_preds_df.to_csv("test_predictions_all_models.csv", index=False)
 
-    # Save summary
-    summary = baseline_df.copy()
+    # Save summary (pandas 2.x friendly)
+    summary = pd.read_csv("baseline_model_cv_test_results.csv")
     stack_row = {
-        "model": "STACK(" + "+".join(top3_names) + ")",
+        "model": "STACK(" + "+".join(best_combo) + ")",
         "cv_rmse_mean": np.nan,
         "cv_rmse_std": np.nan,
         "cv_r2_mean": np.nan,
         "cv_r2_std": np.nan,
-        "test_rmse": stack_rmse,
-        "test_r2": stack_r2,
+        "test_rmse": best_test_rmse,
+        "test_r2": best_test_r2,
     }
-    summary = pd.concat([summary, pd.DataFrame([stack_row])], ignore_index=True)
-    summary.to_csv("final_summary.csv", index=False)
+    final_summary = pd.concat([summary, pd.DataFrame([stack_row])], ignore_index=True)
+    final_summary.to_csv("final_summary.csv", index=False)
 
     print("Artifacts written:")
     print(" - baseline_model_cv_test_results.csv")
     print(" - baseline_cv_rmse.png, baseline_cv_r2.png")
     print(" - baseline_test_rmse.png, baseline_test_r2.png")
     print(" - tuning_histories.json (if tuning ran)")
-    print(" - stack_true_vs_pred.png")
-    print(" - best_vs_stack_rmse.png, best_vs_stack_r2.png")
+    print(" - stacking_grid_results.csv  (all 3-model combos from top-5)")
+    print(" - stack_true_vs_pred_best.png")
+    print(" - best_single_vs_best_stack_rmse.png, best_single_vs_best_stack_r2.png")
     print(" - test_predictions_all_models.csv")
     print(" - final_summary.csv")
 
-
 if __name__ == "__main__":
     main()
-
-
-
