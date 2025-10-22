@@ -268,7 +268,7 @@ def make_objective(name, X_train, y_train, feature_pipe):
         elif name == "SVR":
             C = trial.suggest_float("C", 0.1, 100.0, log=True)
             epsilon = trial.suggest_float("epsilon", 1e-3, 1.0, log=True)
-            gamma = trial.suggest_categorical("gamma", ["scale", "auto")
+            gamma = trial.suggest_categorical("gamma", ["scale", "auto"])
             model = SVR(kernel="rbf", C=C, epsilon=epsilon, gamma=gamma)
 
         elif name == "XGB":
@@ -634,3 +634,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
