@@ -1,12 +1,14 @@
-
 """
 Model selection + hyperparameter tuning + 3-model stacking for Ames-like house prices.
 
 - Evaluates up to 8 base models (RF, XGB, SVR, ElasticNet, Ridge, Lasso, CatBoost, LightGBM)
-- Picks top-5 (by CV RMSE), tunes them with Optuna
+- Selects top-5 (by CV RMSE), tunes them with Optuna
 - Tries ALL 3-model stacks from the top-5 and picks the best on the test split
-- LightGBM hardened: feature_pre_filter=False, force_col_wise=True, safe search space,
-  and manual CV with early stopping during tuning to avoid "-inf gain" stalls.
+- Saves plots and CSV artifacts
+- LightGBM hardened to avoid "-inf gain" and split assertion failures:
+  * feature_pre_filter=False, force_col_wise=True
+  * min_data_in_bin=3, bounded max_depth, guarded num_leaves
+  * manual CV with early stopping during tuning
 """
 
 import warnings
@@ -53,6 +55,7 @@ try:
 except Exception:
     HAS_LGBM = False
 
+# Your feature engineering pipeline (provided by you)
 from house_price_pipeline import make_feature_space
 
 RANDOM_STATE = 42
@@ -64,13 +67,18 @@ RANDOM_STATE = 42
 def rmse(y_true, y_pred) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
+
 def get_scorers():
     # Neg RMSE so higher is better for cross_validate (we'll flip sign later)
     scorers = {
-        "neg_rmse": make_scorer(lambda yt, yp: -math.sqrt(mean_squared_error(yt, yp)), greater_is_better=True),
+        "neg_rmse": make_scorer(
+            lambda yt, yp: -math.sqrt(mean_squared_error(yt, yp)),
+            greater_is_better=True
+        ),
         "r2": "r2",
     }
     return scorers
+
 
 def build_feature_pipeline(X_train: pd.DataFrame, X_test: pd.DataFrame) -> Pipeline:
     # Infer column groups from train/test; safe for TE and rare pooling
@@ -78,7 +86,7 @@ def build_feature_pipeline(X_train: pd.DataFrame, X_test: pd.DataFrame) -> Pipel
 
 
 # ---------------------------
-# Model zoo
+# Model zoo (8 base models)
 # ---------------------------
 def base_models_dict():
     models = {
@@ -96,6 +104,7 @@ def base_models_dict():
         "Lasso": Lasso(alpha=0.0005, max_iter=20000, random_state=RANDOM_STATE),
         "SVR": SVR(kernel="rbf", C=10.0, epsilon=0.1, gamma="scale"),
     }
+
     if HAS_XGB:
         models["XGB"] = xgb.XGBRegressor(
             n_estimators=4000,
@@ -114,6 +123,7 @@ def base_models_dict():
             max_bin=256,
             missing=np.nan
         )
+
     if HAS_CAT:
         models["CatBoost"] = CatBoostRegressor(
             loss_function="RMSE",
@@ -126,27 +136,31 @@ def base_models_dict():
             random_state=RANDOM_STATE,
             verbose=False
         )
+
     if HAS_LGBM:
-        # Robust defaults to avoid -inf gain stalls
+        # Robust defaults to avoid -inf gain stalls and right_count==0 fatal
         models["LGBM"] = LGBMRegressor(
-            n_estimators=4000,                # moderate upper bound (no eval_set in StackingRegressor)
+            n_estimators=4000,               # moderate upper bound (no eval_set in StackingRegressor)
             learning_rate=0.03,
             num_leaves=31,
-            max_depth=12,                    # cap depth to keep trees healthy
+            max_depth=12,                   # cap depth to keep trees healthy
             min_child_samples=20,
-            min_child_weight=1e-3,           # alias of min_sum_hessian_in_leaf
+            min_child_weight=1e-3,          # alias of min_sum_hessian_in_leaf
             subsample=0.8,
             colsample_bytree=0.8,
             reg_alpha=0.1,
             reg_lambda=1.0,
             min_split_gain=0.0,
-            feature_pre_filter=False,        # critical to avoid "all features filtered" on small folds
-            force_col_wise=True,             # more stable on wide/sparse OHE inputs
-            zero_as_missing=True,
+            min_data_in_bin=3,
+            max_bin=255,
+            feature_pre_filter=False,       # critical to avoid "all features filtered" on small folds
+            force_col_wise=True,            # more stable on wide/sparse OHE inputs
+            objective="regression",
             deterministic=True,
             verbosity=-1,
             n_jobs=-1
         )
+
     return models
 
 
@@ -161,8 +175,11 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
     for name, est in models.items():
         pipe = Pipeline([("features", clone(feature_pipe)), ("model", est)])
         cv = KFold(n_splits=cv_splits, shuffle=True, random_state=RANDOM_STATE)
+
+        # Cross-validated scores
         scores = cross_validate(
-            pipe, X_train, y_train, cv=cv, scoring=get_scorers(), return_train_score=False, n_jobs=-1
+            pipe, X_train, y_train, cv=cv, scoring=get_scorers(),
+            return_train_score=False, n_jobs=-1
         )
         mean_neg_rmse = scores["test_neg_rmse"].mean()
         std_neg_rmse = scores["test_neg_rmse"].std()
@@ -170,7 +187,25 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
         std_r2 = scores["test_r2"].std()
 
         # Fit once on full train and evaluate on test
-        pipe.fit(X_train, y_train)
+        try:
+            pipe.fit(X_train, y_train)
+        except Exception as e:
+            # Very defensive fallback for LightGBM-specific corner cases
+            if HAS_LGBM and isinstance(est, LGBMRegressor):
+                print(f"[warn] LightGBM fit failed in baseline for {name} ({e}). Retrying with safer params...")
+                safer = clone(est)
+                # Nudge towards safer region
+                safer.set_params(
+                    num_leaves=min(31, getattr(est, "num_leaves", 31)),
+                    max_depth=min(10, getattr(est, "max_depth", 12) if getattr(est, "max_depth", 12) > 0 else 10),
+                    min_child_samples=max(30, getattr(est, "min_child_samples", 20)),
+                    min_data_in_bin=max(5, getattr(est, "min_data_in_bin", 3)),
+                )
+                pipe = Pipeline([("features", clone(feature_pipe)), ("model", safer)])
+                pipe.fit(X_train, y_train)
+            else:
+                raise
+
         yp = pipe.predict(X_test)
         test_rmse = rmse(y_test, yp)
         test_r2 = r2_score(y_test, yp)
@@ -186,7 +221,7 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
         })
         preds_test[name] = yp
 
-        print(f"{name:<14s}  CV RMSE={-mean_neg_rmse:.4f}  CV R2={mean_r2:.4f}  | Test RMSE={test_rmse:.4f}  Test R2={test_r2:.4f}")
+        print(f"{name:<12s}  CV RMSE={-mean_neg_rmse:.4f}  CV R2={mean_r2:.4f}  | Test RMSE={test_rmse:.4f}  Test R2={test_r2:.4f}")
 
     res_df = pd.DataFrame(results).sort_values("cv_rmse_mean")
     # Save
@@ -245,6 +280,7 @@ def _guard_num_leaves(num_leaves: int, max_depth: int) -> int:
     if max_depth is not None and max_depth > 0:
         return int(min(num_leaves, 2 ** max_depth - 1))
     return int(num_leaves)
+
 
 def make_objective(name, X_train, y_train, feature_pipe):
     def objective(trial):
@@ -357,15 +393,17 @@ def make_objective(name, X_train, y_train, feature_pipe):
                 reg_alpha=reg_alpha,
                 reg_lambda=reg_lambda,
                 min_split_gain=min_split_gain,
+                min_data_in_bin=3,
+                max_bin=255,
                 feature_pre_filter=False,
                 force_col_wise=True,
-                zero_as_missing=True,
+                objective="regression",
                 deterministic=True,
                 verbosity=-1,
                 n_jobs=-1
             )
 
-            # Manual CV with early stopping (since sklearn's cross_validate can't pass eval_set per fold)
+            # Manual CV with early stopping (since cross_validate can't pass eval_set per fold)
             cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
             rmses = []
             for tr_idx, va_idx in cv.split(X_train):
@@ -395,11 +433,14 @@ def make_objective(name, X_train, y_train, feature_pipe):
         pipe = Pipeline([("features", clone(feature_pipe)), ("model", model)])
         cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
         scores = cross_validate(
-            pipe, X_train, y_train, cv=cv, scoring=get_scorers(), return_train_score=False, n_jobs=-1
+            pipe, X_train, y_train, cv=cv, scoring=get_scorers(),
+            return_train_score=False, n_jobs=-1
         )
         cv_rmse = -scores["test_neg_rmse"].mean()
         return cv_rmse
+
     return objective
+
 
 def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
     tuned = {}
@@ -496,9 +537,11 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 reg_alpha=best_params.get("reg_alpha", 0.1),
                 reg_lambda=best_params.get("reg_lambda", 1.0),
                 min_split_gain=best_params.get("min_split_gain", 0.0),
+                min_data_in_bin=3,
+                max_bin=255,
                 feature_pre_filter=False,
                 force_col_wise=True,
-                zero_as_missing=True,
+                objective="regression",
                 deterministic=True,
                 verbosity=-1,
                 n_jobs=-1
@@ -534,6 +577,7 @@ def build_stacking_from_names(names, tuned: dict, base_models: dict, feature_pip
     ])
     return stack
 
+
 def fit_and_eval_stack(stack: Pipeline, X_train, y_train, X_test, y_test, do_cv=True):
     cv_rmse = np.nan
     cv_r2 = np.nan
@@ -543,7 +587,8 @@ def fit_and_eval_stack(stack: Pipeline, X_train, y_train, X_test, y_test, do_cv=
         cv_rmse = -scores["test_neg_rmse"].mean()
         cv_r2 = scores["test_r2"].mean()
 
-    stack.fit(X_train, y_train)  # cannot pass eval_set via StackingRegressor; keep LGBM reasonable
+    # In StackingRegressor.fit we cannot pass eval_set; keep base models' params safe
+    stack.fit(X_train, y_train)
     yp = stack.predict(X_test)
     test_rmse = rmse(y_test, yp)
     test_r2 = r2_score(y_test, yp)
@@ -688,6 +733,7 @@ def main():
     print(" - best_single_vs_best_stack_rmse.png, best_single_vs_best_stack_r2.png")
     print(" - test_predictions_all_models.csv")
     print(" - final_summary.csv")
+
 
 if __name__ == "__main__":
     main()
