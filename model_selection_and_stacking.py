@@ -2,11 +2,11 @@
 """
 Model selection + hyperparameter tuning + 3-model stacking for Ames-like house prices.
 
-Now tries ALL 3-model combinations from the top-5 models (C(5,3)=10 combos),
-evaluates each, and keeps the best stack by Test RMSE.
-
-Models pool (up to 8):
-- RandomForest, XGB, SVR, ElasticNet, Ridge, Lasso, CatBoost, LightGBM
+- Evaluates up to 8 base models (RF, XGB, SVR, ElasticNet, Ridge, Lasso, CatBoost, LightGBM)
+- Picks top-5 (by CV RMSE), tunes them with Optuna
+- Tries ALL 3-model stacks from the top-5 and picks the best on the test split
+- LightGBM hardened: feature_pre_filter=False, force_col_wise=True, safe search space,
+  and manual CV with early stopping during tuning to avoid "-inf gain" stalls.
 """
 
 import warnings
@@ -47,6 +47,7 @@ except Exception:
     HAS_CAT = False
 
 try:
+    import lightgbm as lgb
     from lightgbm import LGBMRegressor
     HAS_LGBM = True
 except Exception:
@@ -56,11 +57,11 @@ from house_price_pipeline import make_feature_space
 
 RANDOM_STATE = 42
 
+
 # ---------------------------
 # Helpers
 # ---------------------------
 def rmse(y_true, y_pred) -> float:
-    from sklearn.metrics import mean_squared_error
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 def get_scorers():
@@ -75,6 +76,10 @@ def build_feature_pipeline(X_train: pd.DataFrame, X_test: pd.DataFrame) -> Pipel
     # Infer column groups from train/test; safe for TE and rare pooling
     return make_feature_space(X_train, X_test)
 
+
+# ---------------------------
+# Model zoo
+# ---------------------------
 def base_models_dict():
     models = {
         "RandomForest": RandomForestRegressor(
@@ -91,8 +96,7 @@ def base_models_dict():
         "Lasso": Lasso(alpha=0.0005, max_iter=20000, random_state=RANDOM_STATE),
         "SVR": SVR(kernel="rbf", C=10.0, epsilon=0.1, gamma="scale"),
     }
-    try:
-        import xgboost as xgb
+    if HAS_XGB:
         models["XGB"] = xgb.XGBRegressor(
             n_estimators=4000,
             learning_rate=0.03,
@@ -110,10 +114,7 @@ def base_models_dict():
             max_bin=256,
             missing=np.nan
         )
-    except Exception:
-        pass
-    try:
-        from catboost import CatBoostRegressor
+    if HAS_CAT:
         models["CatBoost"] = CatBoostRegressor(
             loss_function="RMSE",
             n_estimators=3000,
@@ -125,28 +126,33 @@ def base_models_dict():
             random_state=RANDOM_STATE,
             verbose=False
         )
-    except Exception:
-        pass
-    try:
-        from lightgbm import LGBMRegressor
+    if HAS_LGBM:
+        # Robust defaults to avoid -inf gain stalls
         models["LGBM"] = LGBMRegressor(
-            n_estimators=5000,
+            n_estimators=4000,                # moderate upper bound (no eval_set in StackingRegressor)
             learning_rate=0.03,
             num_leaves=31,
-            max_depth=-1,
+            max_depth=12,                    # cap depth to keep trees healthy
             min_child_samples=20,
+            min_child_weight=1e-3,           # alias of min_sum_hessian_in_leaf
             subsample=0.8,
             colsample_bytree=0.8,
             reg_alpha=0.1,
             reg_lambda=1.0,
             min_split_gain=0.0,
-            random_state=RANDOM_STATE,
+            feature_pre_filter=False,        # critical to avoid "all features filtered" on small folds
+            force_col_wise=True,             # more stable on wide/sparse OHE inputs
+            zero_as_missing=True,
+            deterministic=True,
+            verbosity=-1,
             n_jobs=-1
         )
-    except Exception:
-        pass
     return models
 
+
+# ---------------------------
+# Baseline evaluation
+# ---------------------------
 def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe: Pipeline, cv_splits=5, out_prefix="baseline"):
     results = []
     preds_test = {}
@@ -231,9 +237,15 @@ def evaluate_models(models: dict, X_train, y_train, X_test, y_test, feature_pipe
 
     return res_df, preds_df
 
+
 # ---------------------------
-# Optuna tuning
+# Optuna tuning (with LGBM early stopping & guards)
 # ---------------------------
+def _guard_num_leaves(num_leaves: int, max_depth: int) -> int:
+    if max_depth is not None and max_depth > 0:
+        return int(min(num_leaves, 2 ** max_depth - 1))
+    return int(num_leaves)
+
 def make_objective(name, X_train, y_train, feature_pipe):
     def objective(trial):
         if name == "RandomForest":
@@ -271,8 +283,7 @@ def make_objective(name, X_train, y_train, feature_pipe):
             gamma = trial.suggest_categorical("gamma", ["scale", "auto"])
             model = SVR(kernel="rbf", C=C, epsilon=epsilon, gamma=gamma)
 
-        elif name == "XGB":
-            import xgboost as xgb
+        elif name == "XGB" and HAS_XGB:
             learning_rate = trial.suggest_float("learning_rate", 0.005, 0.08, log=True)
             max_depth = trial.suggest_int("max_depth", 3, 7)
             min_child_weight = trial.suggest_float("min_child_weight", 1.0, 8.0)
@@ -300,8 +311,7 @@ def make_objective(name, X_train, y_train, feature_pipe):
                 missing=np.nan
             )
 
-        elif name == "CatBoost":
-            from catboost import CatBoostRegressor
+        elif name == "CatBoost" and HAS_CAT:
             n_estimators = trial.suggest_int("n_estimators", 1000, 6000, step=500)
             depth = trial.suggest_int("depth", 4, 10)
             learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
@@ -320,42 +330,73 @@ def make_objective(name, X_train, y_train, feature_pipe):
                 verbose=False
             )
 
-        elif name == "LGBM":
-            from lightgbm import LGBMRegressor
+        elif name == "LGBM" and HAS_LGBM:
+            # Safe search space + guards
             n_estimators = trial.suggest_int("n_estimators", 2000, 8000, step=500)
             learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
-            num_leaves = trial.suggest_int("num_leaves", 16, 128, step=4)
-            max_depth = trial.suggest_int("max_depth", -1, 32)
-            min_child_samples = trial.suggest_int("min_child_samples", 5, 50)
+            max_depth = trial.suggest_int("max_depth", 6, 16)   # avoid -1 to keep finite depth
+            num_leaves = trial.suggest_int("num_leaves", 16, 255)
+            num_leaves = _guard_num_leaves(num_leaves, max_depth)
+            min_child_samples = trial.suggest_int("min_child_samples", 5, 60)
+            min_child_weight = trial.suggest_float("min_child_weight", 1e-3, 1.0, log=True)  # alias: min_sum_hessian_in_leaf
             subsample = trial.suggest_float("subsample", 0.6, 0.95)
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.6, 1.0)
             reg_alpha = trial.suggest_float("reg_alpha", 0.0, 1.0)
             reg_lambda = trial.suggest_float("reg_lambda", 0.0, 10.0)
             min_split_gain = trial.suggest_float("min_split_gain", 0.0, 0.5)
-            model = LGBMRegressor(
+
+            base = LGBMRegressor(
                 n_estimators=n_estimators,
                 learning_rate=learning_rate,
                 num_leaves=num_leaves,
                 max_depth=max_depth,
                 min_child_samples=min_child_samples,
+                min_child_weight=min_child_weight,
                 subsample=subsample,
                 colsample_bytree=colsample_bytree,
                 reg_alpha=reg_alpha,
                 reg_lambda=reg_lambda,
                 min_split_gain=min_split_gain,
-                random_state=RANDOM_STATE,
+                feature_pre_filter=False,
+                force_col_wise=True,
+                zero_as_missing=True,
+                deterministic=True,
+                verbosity=-1,
                 n_jobs=-1
             )
+
+            # Manual CV with early stopping (since sklearn's cross_validate can't pass eval_set per fold)
+            cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+            rmses = []
+            for tr_idx, va_idx in cv.split(X_train):
+                X_tr = X_train.iloc[tr_idx]; y_tr = y_train.iloc[tr_idx]
+                X_va = X_train.iloc[va_idx]; y_va = y_train.iloc[va_idx]
+
+                fp = clone(feature_pipe)
+                Xtr_feat = fp.fit_transform(X_tr, y_tr)
+                Xva_feat = fp.transform(X_va)
+
+                mdl = clone(base)
+                mdl.fit(
+                    Xtr_feat, y_tr,
+                    eval_set=[(Xva_feat, y_va)],
+                    eval_metric="rmse",
+                    callbacks=[lgb.early_stopping(200, verbose=False), lgb.log_evaluation(0)],
+                )
+                ypv = mdl.predict(Xva_feat, num_iteration=getattr(mdl, "best_iteration_", None))
+                rmses.append(rmse(y_va, ypv))
+
+            return float(np.mean(rmses))
 
         else:
             raise RuntimeError(f"Unknown or unavailable model for tuning: {name}")
 
+        # Default path for non-LGBM models: standard CV
         pipe = Pipeline([("features", clone(feature_pipe)), ("model", model)])
         cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
         scores = cross_validate(
             pipe, X_train, y_train, cv=cv, scoring=get_scorers(), return_train_score=False, n_jobs=-1
         )
-        # Objective: minimize CV RMSE
         cv_rmse = -scores["test_neg_rmse"].mean()
         return cv_rmse
     return objective
@@ -364,11 +405,15 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
     tuned = {}
     histories = {}
     for name in top_names:
-        try:
-            import optuna  # ensure available
-        except Exception:
+        if not HAS_OPTUNA:
             print("[tune] Optuna not installed; skipping tuning for", name)
             continue
+        if name == "XGB" and not HAS_XGB:
+            print("[tune] Skipping XGB (xgboost not installed)."); continue
+        if name == "CatBoost" and not HAS_CAT:
+            print("[tune] Skipping CatBoost (catboost not installed)."); continue
+        if name == "LGBM" and not HAS_LGBM:
+            print("[tune] Skipping LGBM (lightgbm not installed)."); continue
 
         print(f"[tune] Tuning {name} for {n_trials} trials...")
         study = optuna.create_study(direction="minimize")
@@ -377,7 +422,7 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
         best_score = study.best_value
         histories[name] = [(t.number, t.value) for t in study.trials]
 
-        # Rebuild estimator with best params
+        # Rebuild estimator with best params + safe flags
         if name == "RandomForest":
             model = RandomForestRegressor(
                 n_estimators=best_params.get("n_estimators", 800),
@@ -406,8 +451,7 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 epsilon=best_params.get("epsilon", 0.1),
                 gamma=best_params.get("gamma", "scale"),
             )
-        elif name == "XGB":
-            import xgboost as xgb
+        elif name == "XGB" and HAS_XGB:
             model = xgb.XGBRegressor(
                 n_estimators=6000,
                 learning_rate=best_params.get("learning_rate", 0.03),
@@ -425,8 +469,7 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 max_bin=best_params.get("max_bin", 256),
                 missing=np.nan
             )
-        elif name == "CatBoost":
-            from catboost import CatBoostRegressor
+        elif name == "CatBoost" and HAS_CAT:
             model = CatBoostRegressor(
                 loss_function="RMSE",
                 n_estimators=best_params.get("n_estimators", 3000),
@@ -438,20 +481,26 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
                 random_state=RANDOM_STATE,
                 verbose=False
             )
-        elif name == "LGBM":
-            from lightgbm import LGBMRegressor
+        elif name == "LGBM" and HAS_LGBM:
+            max_depth = best_params.get("max_depth", 12)
+            num_leaves = _guard_num_leaves(best_params.get("num_leaves", 31), max_depth)
             model = LGBMRegressor(
-                n_estimators=best_params.get("n_estimators", 5000),
+                n_estimators=best_params.get("n_estimators", 4000),
                 learning_rate=best_params.get("learning_rate", 0.03),
-                num_leaves=best_params.get("num_leaves", 31),
-                max_depth=best_params.get("max_depth", -1),
+                num_leaves=num_leaves,
+                max_depth=max_depth,
                 min_child_samples=best_params.get("min_child_samples", 20),
+                min_child_weight=best_params.get("min_child_weight", 1e-3),
                 subsample=best_params.get("subsample", 0.8),
                 colsample_bytree=best_params.get("colsample_bytree", 0.8),
                 reg_alpha=best_params.get("reg_alpha", 0.1),
                 reg_lambda=best_params.get("reg_lambda", 1.0),
                 min_split_gain=best_params.get("min_split_gain", 0.0),
-                random_state=RANDOM_STATE,
+                feature_pre_filter=False,
+                force_col_wise=True,
+                zero_as_missing=True,
+                deterministic=True,
+                verbosity=-1,
                 n_jobs=-1
             )
         else:
@@ -465,6 +514,10 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
         print(f"[tune] {name}: best CV RMSE={best_score:.5f}, best_params={best_params}")
     return tuned, histories
 
+
+# ---------------------------
+# Stacking
+# ---------------------------
 def build_stacking_from_names(names, tuned: dict, base_models: dict, feature_pipe: Pipeline):
     # Use tuned estimator if available, else baseline default
     estimators = []
@@ -490,12 +543,16 @@ def fit_and_eval_stack(stack: Pipeline, X_train, y_train, X_test, y_test, do_cv=
         cv_rmse = -scores["test_neg_rmse"].mean()
         cv_r2 = scores["test_r2"].mean()
 
-    stack.fit(X_train, y_train)
+    stack.fit(X_train, y_train)  # cannot pass eval_set via StackingRegressor; keep LGBM reasonable
     yp = stack.predict(X_test)
     test_rmse = rmse(y_test, yp)
     test_r2 = r2_score(y_test, yp)
     return cv_rmse, cv_r2, test_rmse, test_r2, yp
 
+
+# ---------------------------
+# Main
+# ---------------------------
 def main():
     # Load data
     df = pd.read_csv("train-house-prices-advanced-regression-techniques.csv")
@@ -634,4 +691,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
