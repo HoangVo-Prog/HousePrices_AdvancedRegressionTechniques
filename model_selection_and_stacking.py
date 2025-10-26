@@ -199,8 +199,88 @@ def base_models_dict():
 # ---------------------------
 def make_objective(name, X_train, y_train, feature_pipe):
     def objective(trial):
-        # ... keep all other model cases the same ...
-        
+        if name == "RandomForest":
+            n_estimators = trial.suggest_int("n_estimators", 300, 1200, step=100)
+            max_depth = trial.suggest_int("max_depth", 4, 30)
+            min_samples_split = trial.suggest_int("min_samples_split", 2, 10)
+            min_samples_leaf = trial.suggest_int("min_samples_leaf", 1, 10)
+            max_features = trial.suggest_categorical("max_features", ["sqrt", "log2", None])
+            model = RandomForestRegressor(
+                n_estimators=n_estimators,
+                max_depth=max_depth,
+                min_samples_split=min_samples_split,
+                min_samples_leaf=min_samples_leaf,
+                max_features=max_features,
+                n_jobs=-1,
+                random_state=RANDOM_STATE,
+            )
+
+        elif name == "ElasticNet":
+            alpha = trial.suggest_float("alpha", 1e-4, 1.0, log=True)
+            l1_ratio = trial.suggest_float("l1_ratio", 0.0, 1.0)
+            model = ElasticNet(alpha=alpha, l1_ratio=l1_ratio, max_iter=30000, random_state=RANDOM_STATE)
+
+        elif name == "Ridge":
+            alpha = trial.suggest_float("alpha", 1e-3, 100.0, log=True)
+            model = Ridge(alpha=alpha, random_state=RANDOM_STATE)
+
+        elif name == "Lasso":
+            alpha = trial.suggest_float("alpha", 1e-5, 1.0, log=True)
+            model = Lasso(alpha=alpha, max_iter=30000, random_state=RANDOM_STATE)
+
+        elif name == "SVR":
+            C = trial.suggest_float("C", 0.1, 100.0, log=True)
+            epsilon = trial.suggest_float("epsilon", 1e-3, 1.0, log=True)
+            gamma = trial.suggest_categorical("gamma", ["scale", "auto"])
+            model = SVR(kernel="rbf", C=C, epsilon=epsilon, gamma=gamma)
+
+        elif name == "XGB" and HAS_XGB:
+            learning_rate = trial.suggest_float("learning_rate", 0.005, 0.08, log=True)
+            max_depth = trial.suggest_int("max_depth", 3, 7)
+            min_child_weight = trial.suggest_float("min_child_weight", 1.0, 8.0)
+            subsample = trial.suggest_float("subsample", 0.6, 0.95)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.6, 0.95)
+            reg_lambda = trial.suggest_float("reg_lambda", 0.3, 10.0, log=True)
+            reg_alpha = trial.suggest_float("reg_alpha", 0.0, 1.0)
+            gamma = trial.suggest_float("gamma", 0.0, 0.3)
+            max_bin = trial.suggest_int("max_bin", 128, 512)
+            model = xgb.XGBRegressor(
+                n_estimators=6000,
+                learning_rate=learning_rate,
+                max_depth=max_depth,
+                subsample=subsample,
+                colsample_bytree=colsample_bytree,
+                min_child_weight=min_child_weight,
+                reg_lambda=reg_lambda,
+                reg_alpha=reg_alpha,
+                gamma=gamma,
+                objective="reg:squarederror",
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+                tree_method="hist",
+                max_bin=max_bin,
+                missing=np.nan
+            )
+
+        elif name == "CatBoost" and HAS_CAT:
+            n_estimators = trial.suggest_int("n_estimators", 1000, 6000, step=500)
+            depth = trial.suggest_int("depth", 4, 10)
+            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.2, log=True)
+            l2_leaf_reg = trial.suggest_float("l2_leaf_reg", 1.0, 10.0, log=True)
+            subsample = trial.suggest_float("subsample", 0.6, 0.95)
+            colsample_bylevel = trial.suggest_float("colsample_bylevel", 0.6, 1.0)
+            model = CatBoostRegressor(
+                loss_function="RMSE",
+                n_estimators=n_estimators,
+                depth=depth,
+                learning_rate=learning_rate,
+                l2_leaf_reg=l2_leaf_reg,
+                subsample=subsample,
+                colsample_bylevel=colsample_bylevel,
+                random_state=RANDOM_STATE,
+                verbose=False
+            )
+            
         elif name == "LGBM" and HAS_LGBM:
             # Use the wrapper for tuning too
             max_n_estimators = trial.suggest_int("max_n_estimators", 1000, 4000, step=500)
@@ -303,3 +383,4 @@ def tune_top_models(top_names, X_train, y_train, feature_pipe, n_trials=40):
         }
         print(f"[tune] {name}: best CV RMSE={best_score:.5f}, best_params={best_params}")
     return tuned, histories
+
